@@ -180,6 +180,19 @@ pub fn bucket_by_worktree(
     worktrees: &[(WorkspaceId, &Path)],
 ) -> HashMap<WorkspaceId, Vec<ProcInfo>> {
     let by_pid: HashMap<i32, &ProcInfo> = procs.iter().map(|p| (p.pid, p)).collect();
+    // `lsof` reports cwds with symlinks resolved; the stored worktree path
+    // is whatever the user configured. Match on the resolved form as well
+    // as the raw one, or a worktree base behind a symlink (every macOS
+    // temp dir, via `/var -> /private/var`) never buckets anything.
+    // Resolved once per call, not per process. A path that can't be
+    // resolved (already deleted) just keeps its raw form.
+    let resolved: Vec<(WorkspaceId, &Path, Option<PathBuf>)> = worktrees
+        .iter()
+        .map(|(id, wt)| {
+            let canon = std::fs::canonicalize(wt).ok().filter(|c| c != *wt);
+            (*id, *wt, canon)
+        })
+        .collect();
     let mut out: HashMap<WorkspaceId, Vec<ProcInfo>> = HashMap::new();
     for p in procs {
         if PROC_DENYLIST.contains(&p.command.as_str()) {
@@ -188,8 +201,10 @@ pub fn bucket_by_worktree(
         if !p.listening && ancestor_denied(p.ppid, &by_pid) {
             continue;
         }
-        for (id, wt) in worktrees {
-            if p.cwd.starts_with(wt) {
+        for (id, wt, canon) in &resolved {
+            let hit =
+                p.cwd.starts_with(wt) || canon.as_deref().is_some_and(|c| p.cwd.starts_with(c));
+            if hit {
                 out.entry(*id).or_default().push(p.clone());
                 break;
             }
@@ -372,6 +387,111 @@ pub async fn kill_pid(pid: i32, signal: &str) -> Result<()> {
         "kill pid {pid} ({signal}): {}",
         stderr.trim()
     )))
+}
+
+/// How long archive gives a tracked process to exit after SIGTERM before
+/// escalating to SIGKILL. Short enough that a CLI archive doesn't feel
+/// hung; long enough for a dev server to flush and close its port.
+pub const ARCHIVE_TERM_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Liveness probe via `kill(pid, 0)`: signal 0 delivers nothing but
+/// still reports whether the pid exists. `EPERM` means it exists but
+/// belongs to someone else — still alive from our point of view.
+pub fn pid_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: `kill` with signal 0 has no side effects; it only checks
+    // whether the pid is addressable.
+    let rc = unsafe { libc::kill(pid, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// What `terminate_pids` did to each pid it was given.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TerminateReport {
+    /// Pids that were still alive after the grace period and got SIGKILL.
+    pub escalated: Vec<i32>,
+    /// Pids a signal could not be delivered to, with the error. A pid
+    /// that had already exited is *not* a failure — `kill_pid` absorbs
+    /// ESRCH — so this is EPERM and the like: processes archive could
+    /// see but not stop.
+    pub failed: Vec<(i32, String)>,
+}
+
+/// SIGTERM every pid, wait up to `grace` for them to exit, then SIGKILL
+/// whatever is left. Best-effort by design — archive must not strand a
+/// workspace row over a process it cannot signal — but nothing is
+/// silently dropped: every undeliverable signal lands in the report.
+///
+/// Nonpositive pids are ignored outright. `kill 0` addresses the
+/// caller's own process group and negative pids address whole groups,
+/// so a malformed scan line must never reach the signal call.
+///
+/// Identity is by bare pid. Between TERM and KILL the pid could in
+/// principle be recycled onto an unrelated process, but that needs the
+/// pid space to wrap inside the grace window (about four million pids
+/// on Linux, about a hundred thousand on macOS, allocated sequentially),
+/// which is not a realistic rate on a workstation.
+pub async fn terminate_pids(pids: &[i32], grace: std::time::Duration) -> TerminateReport {
+    let mut report = TerminateReport::default();
+    let mut pending = Vec::new();
+    for &pid in pids.iter().filter(|&&p| p > 0) {
+        match kill_pid(pid, "TERM").await {
+            Ok(()) => pending.push(pid),
+            Err(e) => report.failed.push((pid, e.to_string())),
+        }
+    }
+    let deadline = std::time::Instant::now() + grace;
+    pending.retain(|&p| pid_alive(p));
+    while !pending.is_empty() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        pending.retain(|&p| pid_alive(p));
+    }
+    for &pid in &pending {
+        match kill_pid(pid, "KILL").await {
+            Ok(()) => report.escalated.push(pid),
+            Err(e) => report.failed.push((pid, e.to_string())),
+        }
+    }
+    report
+}
+
+/// Outcome of `kill_tracked_processes`: what was found plus what
+/// `terminate_pids` managed to do about it.
+#[derive(Debug, Default, Clone)]
+pub struct TrackedTeardown {
+    /// Every process the scan bucketed under the worktree.
+    pub tracked: Vec<ProcInfo>,
+    pub report: TerminateReport,
+}
+
+/// Stop every process the processes modal would list for `worktree`:
+/// scan, bucket under this one worktree with the same denylist rules
+/// the modal uses, then `terminate_pids`. A missing `lsof` yields an
+/// empty scan and therefore a no-op. The scan is a snapshot: anything
+/// started afterwards (by the archive script, say) is not covered.
+pub async fn kill_tracked_processes(ws_id: WorkspaceId, worktree: &Path) -> TrackedTeardown {
+    let procs = scan().await;
+    let tracked = bucket_by_worktree(&procs, &[(ws_id, worktree)])
+        .remove(&ws_id)
+        .unwrap_or_default();
+    if tracked.is_empty() {
+        return TrackedTeardown::default();
+    }
+    let pids: Vec<i32> = tracked.iter().map(|p| p.pid).collect();
+    let report = terminate_pids(&pids, ARCHIVE_TERM_GRACE).await;
+    tracing::info!(
+        worktree = %worktree.display(),
+        signalled = pids.len(),
+        escalated = report.escalated.len(),
+        failed = report.failed.len(),
+        "stopped tracked processes for archive"
+    );
+    for (pid, err) in &report.failed {
+        tracing::warn!(pid, error = %err, "could not stop tracked process during archive");
+    }
+    TrackedTeardown { tracked, report }
 }
 
 #[cfg(test)]
@@ -742,5 +862,160 @@ mod tests {
     #[test]
     fn parse_listening_pids_handles_empty() {
         assert!(parse_listening_pids("").is_empty());
+    }
+
+    /// `lsof` reports a process's cwd with symlinks resolved, while the
+    /// worktree path wsx stores is whatever the user configured. On macOS
+    /// every temp dir is behind `/var -> /private/var`, and a worktree
+    /// base under a symlink hits the same mismatch anywhere. Bucketing
+    /// must match on the resolved path.
+    #[test]
+    fn bucket_by_worktree_matches_cwd_through_a_symlinked_worktree_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(real.join("wt")).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let resolved_cwd = std::fs::canonicalize(real.join("wt")).unwrap();
+        let procs = vec![proc(100, 1, "node", resolved_cwd.to_str().unwrap())];
+        let via_link = link.join("wt");
+        let out = bucket_by_worktree(&procs, &[(WorkspaceId(1), via_link.as_path())]);
+        assert_eq!(
+            out.get(&WorkspaceId(1)).map(|v| v.len()),
+            Some(1),
+            "cwd {resolved_cwd:?} should bucket under symlinked worktree {via_link:?}"
+        );
+    }
+
+    // ---- terminate_pids ------------------------------------------------
+
+    /// A spawned child that is reaped on a background thread (so liveness
+    /// checks see it exit promptly rather than linger as a zombie) and
+    /// SIGKILLed on drop, so a failed assertion can't leak it past the test.
+    struct ReapedChild {
+        pid: i32,
+        waiter: Option<std::thread::JoinHandle<std::process::ExitStatus>>,
+    }
+
+    impl ReapedChild {
+        fn spawn(child: std::process::Child) -> Self {
+            let pid = child.id() as i32;
+            let mut child = child;
+            let waiter = std::thread::spawn(move || child.wait().unwrap());
+            Self {
+                pid,
+                waiter: Some(waiter),
+            }
+        }
+
+        fn status(mut self) -> std::process::ExitStatus {
+            self.waiter.take().unwrap().join().unwrap()
+        }
+    }
+
+    impl Drop for ReapedChild {
+        fn drop(&mut self) {
+            if self.waiter.is_some() {
+                // SAFETY: plain signal send to a pid this test spawned.
+                unsafe {
+                    libc::kill(self.pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn terminate_pids_ends_cooperative_process_with_term_only() {
+        use std::os::unix::process::ExitStatusExt;
+        let child = ReapedChild::spawn(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap(),
+        );
+        let pid = child.pid;
+        let report = terminate_pids(&[pid], std::time::Duration::from_secs(5)).await;
+        assert!(
+            report.escalated.is_empty(),
+            "sleep honours TERM; got {report:?}"
+        );
+        assert!(report.failed.is_empty(), "{report:?}");
+        assert_eq!(child.status().signal(), Some(libc::SIGTERM));
+        assert!(!pid_alive(pid));
+    }
+
+    #[tokio::test]
+    async fn terminate_pids_escalates_to_kill_when_term_is_ignored() {
+        use std::os::unix::process::ExitStatusExt;
+        // Handshake on stdout so TERM can't arrive before `trap` is armed —
+        // an un-trapped shell dies to TERM and the test would pass for the
+        // wrong reason. `exec` makes the ignoring `sleep` the tracked pid
+        // itself, so the KILL leaves no orphan behind.
+        let mut spawned = std::process::Command::new("sh")
+            .args(["-c", "trap '' TERM; echo ready; exec sleep 10"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn sh");
+        {
+            use std::io::BufRead;
+            let mut line = String::new();
+            std::io::BufReader::new(spawned.stdout.take().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            assert_eq!(line.trim(), "ready");
+        }
+        let child = ReapedChild::spawn(spawned);
+        let pid = child.pid;
+        let report = terminate_pids(&[pid], std::time::Duration::from_millis(300)).await;
+        assert_eq!(report.escalated, vec![pid]);
+        assert!(report.failed.is_empty(), "{report:?}");
+        assert_eq!(child.status().signal(), Some(libc::SIGKILL));
+        assert!(!pid_alive(pid));
+    }
+
+    #[tokio::test]
+    async fn terminate_pids_returns_promptly_for_an_already_exited_pid() {
+        let child = ReapedChild::spawn(std::process::Command::new("true").spawn().unwrap());
+        let pid = child.pid;
+        child.status();
+        let started = std::time::Instant::now();
+        let report = terminate_pids(&[pid], std::time::Duration::from_secs(5)).await;
+        assert!(report.escalated.is_empty());
+        assert!(report.failed.is_empty(), "{report:?}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "a dead pid must not wait out the grace period"
+        );
+    }
+
+    /// pid 0 means "my process group" and negative pids address whole
+    /// groups; a malformed scan line must never reach `kill` with one.
+    /// The assertion is survival: had a signal gone out, this test binary
+    /// would have received it.
+    #[tokio::test]
+    async fn terminate_pids_ignores_nonpositive_pids() {
+        let report = terminate_pids(&[0, -1], std::time::Duration::from_secs(5)).await;
+        assert!(report.escalated.is_empty());
+        assert!(report.failed.is_empty(), "{report:?}");
+    }
+
+    /// A pid we may not signal (EPERM) is reported as failed and does not
+    /// burn the grace period — there is nothing to wait for.
+    #[tokio::test]
+    async fn terminate_pids_reports_unsignallable_pid_without_waiting() {
+        // SAFETY: getuid has no side effects.
+        if unsafe { libc::getuid() } == 0 {
+            eprintln!("skipping: root can signal pid 1");
+            return;
+        }
+        let started = std::time::Instant::now();
+        let report = terminate_pids(&[1], std::time::Duration::from_secs(5)).await;
+        assert_eq!(report.failed.len(), 1, "{report:?}");
+        assert_eq!(report.failed[0].0, 1);
+        assert!(report.escalated.is_empty());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "an unsignallable pid must not wait out the grace period"
+        );
     }
 }
